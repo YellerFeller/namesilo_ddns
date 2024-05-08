@@ -1,85 +1,154 @@
 #!/bin/bash
 
-##Domain name:
-DOMAIN="mydomain.tld"
+# Enter your domains and their subdomains in this list
+readonly DOMAINS=(
+    "example.com"
+    "subdomain.example.com"
+    "another.com"
+)
 
-##Host name (subdomain). Optional. If present, must end with a dot (.)
-HOST="subdomain."
+# API key obtained from namesilo
+readonly APIKEY="APIKEY"
 
-##APIKEY obtained from Namesilo:
-APIKEY="c40031261ee449037a4b4"
+# How often to output 'No IP change' log messages in seconds
+readonly NO_IP_CHANGE_TIME=86400
 
-## Do not edit lines below ##
 
-##Saved history pubic IP from last check
+### Don't edit anything below
+
+
+# Saved history public IP from last check
 IP_FILE="/var/tmp/MyPubIP"
 
-##Time IP last updated or 'No IP change' log message output
+# Time IP last updated or 'No IP change' log message output
 IP_TIME="/var/tmp/MyIPTime"
 
-##How often to output 'No IP change' log messages
-NO_IP_CHANGE_TIME=86400
-
-##Response from Namesilo
+# Response from Namesilo
 RESPONSE="/tmp/namesilo_response.xml"
 
-##Choose randomly which OpenDNS resolver to use
-RESOLVER=resolver$(echo $((($RANDOM%4)+1))).opendns.com
-##Get the current public IP using DNS
-CUR_IP="$(dig +short myip.opendns.com @$RESOLVER)"
-ODRC=$?
+# Declare associative array to store domains grouped by root domain
+declare -A DOMAIN_GROUPS
 
-## Try google dns if opendns failed
-if [ $ODRC -ne 0 ]; then
-   logger -t IP.Check -- IP Lookup at $RESOLVER failed!
-   sleep 5
-##Choose randomly which Google resolver to use
-   RESOLVER=ns$(echo $((($RANDOM%4)+1))).google.com
-##Get the current public IP 
-   IPQUOTED=$(dig TXT +short o-o.myaddr.l.google.com @$RESOLVER)
-   GORC=$?
-## Exit if google failed
-   if [ $GORC -ne 0 ]; then
-     logger -t IP.Check -- IP Lookup at $RESOLVER failed!
-     exit 1
-   fi
-   CUR_IP=$(echo $IPQUOTED | awk -F'"' '{ print $2}')
+# Iterate through each domain
+for domain in "${DOMAINS[@]}"; do
+
+    # Split domain by "."
+    IFS='.' read -ra parts <<< "$domain"
+
+    # Extract subdomain and root domain
+    if [ ${#parts[@]} -eq 2 ]; then
+        subdomain=""
+        root_domain="${parts[0]}.${parts[1]}"
+    elif [ ${#parts[@]} -gt 2 ]; then
+        subdomain="${parts[0]}"
+        root_domain="${parts[1]}.${parts[2]}"
+    else
+        logger -t IP.Check -- Invalid domain: $domain
+        continue
+    fi
+
+    # Store domain in the associative array
+    DOMAIN_GROUPS["$root_domain"]+="$domain:$subdomain "
+
+done
+
+
+# Array of public IP services
+readonly PUBLIC_IP_SERVICES=(
+    "http://ifconfig.me/ip"
+    "http://icanhazip.com"
+    "http://ident.me"
+)
+
+# Initialize current IP
+CURRENT_PUBLIC_IP=
+
+# Variable to track if IP has been found
+IP_FOUND=0
+
+# Loop through each service and get the public IP
+for service in "${PUBLIC_IP_SERVICES[@]}"; do
+    if [[ $IP_FOUND -eq 0 ]]; then
+        ip=$(curl -s "$service")
+        if [[ -n $ip ]]; then
+            CURRENT_PUBLIC_IP=$ip
+            IP_FOUND=1
+        else
+            logger -t IP.Check -- Failed to get IP from $service
+        fi
+    fi
+done
+
+# Exit if public IP can't be found
+if [[ $IP_FOUND -eq 0 ]]; then
+    logger -t IP.Check -- Failed to get public IP from all services
+    exit 1
 fi
 
-##Check file for previous IP address
+#Initialize known IP
+KNOWN_IP=
+
+# Check file for previous IP address
 if [ -f $IP_FILE ]; then
-  KNOWN_IP=$(cat $IP_FILE)
+    KNOWN_IP=$(cat $IP_FILE)
 else
-  KNOWN_IP=
+    KNOWN_IP=
 fi
 
-##See if the IP has changed
-if [ "$CUR_IP" != "$KNOWN_IP" ]; then
-  echo $CUR_IP > $IP_FILE
-  logger -t IP.Check -- Public IP changed to $CUR_IP from $RESOLVER
+# See if the IP has changed
+if [ "$CURRENT_PUBLIC_IP" != "$KNOWN_IP" ]; then
 
-  ##Update DNS record in Namesilo:
-  curl -s "https://www.namesilo.com/api/dnsListRecords?version=1&type=xml&key=$APIKEY&domain=$DOMAIN" > $DOMAIN.xml 
-  RECORD_ID=`xmllint --xpath "//namesilo/reply/resource_record/record_id[../host/text() = '$HOST$DOMAIN' ]" $DOMAIN.xml | grep -oP '(?<=<record_id>).*?(?=</record_id>)'`
-  curl -s "https://www.namesilo.com/api/dnsUpdateRecord?version=1&type=xml&key=$APIKEY&domain=$DOMAIN&rrid=$RECORD_ID&rrhost=$HOST&rrvalue=$CUR_IP&rrttl=3600" > $RESPONSE
-    RESPONSE_CODE=`xmllint --xpath "//namesilo/reply/code/text()"  $RESPONSE`
-       case $RESPONSE_CODE in
-       300)
-         date "+%s" > $IP_TIME
-         logger -t IP.Check -- Update success. Now $HOST$DOMAIN IP address is $CUR_IP;;
-       280)
-         logger -t IP.Check -- Duplicate record exists. No update necessary;;
-       *)
-         ## put the old IP back, so that the update will be tried next time
-         echo $KNOWN_IP > $IP_FILE
-         logger -t IP.Check -- DDNS update failed code $RESPONSE_CODE!;;
-     esac
+    echo $CURRENT_PUBLIC_IP > $IP_FILE
+
+    logger -t IP.Check -- Public IP changed to $CURRENT_PUBLIC_IP
+
+    # Iterate through each root domain
+    # Update each sub/root domain to the public IP
+    for root_domain in "${!DOMAIN_GROUPS[@]}"; do
+
+        curl -s "https://www.namesilo.com/apibatch/dnsListRecords?version=1&type=xml&key=$APIKEY&domain=$root_domain" > /tmp/$root_domain.xml
+
+        domains_with_subdomains="${DOMAIN_GROUPS[$root_domain]}"
+
+        read -ra domain_subdomain_pairs <<< "$domains_with_subdomains"
+
+        for pair in "${domain_subdomain_pairs[@]}"; do
+
+            IFS=':' read -r domain subdomain <<< "$pair"
+
+            RECORD_ID=`xmllint --xpath "//namesilo/reply/resource_record/record_id[../host/text() = '$domain' ]" /tmp/$root_domain.xml | grep -oP '(?<=<record_id>).*?(?=</record_id>)'`
+
+            curl -s "https://www.namesilo.com/apibatch/dnsUpdateRecord?version=1&type=xml&key=$APIKEY&domain=$root_domain&rrid=$RECORD_ID&rrhost=$subdomain&rrvalue=$CURRENT_PUBLIC_IP&rrttl=3600" > $RESPONSE
+
+            RESPONSE_CODE=`xmllint --xpath "//namesilo/reply/code/text()"  $RESPONSE`
+
+            case $RESPONSE_CODE in
+                300)
+                    date "+%s" > $IP_TIME
+                    logger -t IP.Check -- Update success. Now $domain IP address is $CURRENT_PUBLIC_IP
+                    ;;
+                280)
+                    logger -t IP.Check -- Duplicate record exists. No update necessary
+                    ;;
+                *)
+                    # put the old IP back, so that the update will be tried next time
+                    echo $KNOWN_IP > $IP_FILE
+                    logger -t IP.Check -- DDNS update failed code $RESPONSE_CODE!
+                    ;;
+            esac
+
+        done
+
+    done
 
 else
-  ## Only log all these events NO_IP_CHANGE_TIME after last update
-  [ $(date "+%s") -gt $((($(cat $IP_TIME)+$NO_IP_CHANGE_TIME))) ] &&
-    logger -t IP.Check -- NO IP change from $RESOLVER &&
+
+    # Only log all these events NO_IP_CHANGE_TIME after last update
+
+    [ $(date "+%s") -gt $((($(cat $IP_TIME)+$NO_IP_CHANGE_TIME))) ] &&
+
+    logger -t IP.Check -- No IP change since $(date -d @$(cat $IP_TIME) +"%Y-%m-%d %H:%M:%S") &&
+
     date "+%s" > $IP_TIME
-fi
 
-exit 0
+fi
